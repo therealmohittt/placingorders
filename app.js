@@ -86,14 +86,14 @@ function normalizeItems(items) {
   const map = new Map();
   for (const it of tmp) map.set(it.product_id, (map.get(it.product_id) || 0) + it.qty);
 
-  // Sort by product_id to reduce deadlock chance
+  // Sort by product_id
   return Array.from(map.entries())
     .map(([product_id, qty]) => ({ product_id, qty }))
     .sort((a, b) => a.product_id - b.product_id);
 }
 
 async function startTx(conn) {
-  // Use explicit statements for wide compatibility
+  // Use explicit statements
   await conn.query("START TRANSACTION");
 }
 async function commitTx(conn) {
@@ -212,4 +212,211 @@ app.get("/products", async (_req, res, next) => {
   } catch (e) {
     next(e);
   }
+});
+
+app.post("/orders", async (req, res, next) => {
+  const { customer_email, items } = req.body || {};
+
+  if (!isValidEmail(customer_email)) {
+    return res.status(400).json({ error: "Invalid customer_email" });
+  }
+
+  const normItems = normalizeItems(items);
+  if (!normItems) {
+    return res.status(400).json({ error: "Invalid items (must be non-empty with qty > 0)" });
+  }
+
+  let conn;
+  try {
+    conn = await pool.getConnection();
+    await startTx(conn);
+
+    const ids = normItems.map(x => x.product_id);
+    const placeholders = ids.map(() => "?").join(",");
+
+    // Lock rows for concurrency
+    const [products] = await conn.query(
+      `
+      SELECT id, stock, price, name
+      FROM products
+      WHERE id IN (${placeholders})
+      FOR UPDATE
+      `,
+      ids
+    );
+
+    if (products.length !== ids.length) {
+      // Unknown product leads to rejection
+      await rollbackTx(conn);
+      const missing = ids.filter(id => !products.find(p => Number(p.id) === Number(id)));
+      const rejId = await createRejectedOrder(null, customer_email, normItems);
+      return res.status(409).json({
+        order_id: rejId,
+        status: "REJECTED",
+        reason: `Unknown product_id(s): ${missing.join(",")}`
+      });
+    }
+
+    const pMap = new Map(products.map(p => [Number(p.id), p]));
+
+    // Validate stock while rows are locked
+    const insufficient = [];
+    for (const it of normItems) {
+      const p = pMap.get(it.product_id);
+      if (!p || Number(p.stock) < it.qty) {
+        insufficient.push({
+          product_id: it.product_id,
+          requested: it.qty,
+          available: p ? Number(p.stock) : 0
+        });
+      }
+    }
+
+    if (insufficient.length > 0) {
+      await rollbackTx(conn);
+      const rejId = await createRejectedOrder(null, customer_email, normItems);
+      return res.status(409).json({
+        order_id: rejId,
+        status: "REJECTED",
+        reason: "Insufficient stock",
+        details: insufficient
+      });
+    }
+
+    // Insert PLACED order
+    const [orderRes] = await conn.query(
+      `INSERT INTO orders (customer_email, status) VALUES (?, 'PLACED')`,
+      [customer_email]
+    );
+    const orderId = orderRes.insertId;
+
+    // Insert order items with unit_price from product.price
+    for (const it of normItems) {
+      const p = pMap.get(it.product_id);
+      await conn.query(
+        `INSERT INTO order_items (order_id, product_id, qty, unit_price)
+         VALUES (?, ?, ?, ?)`,
+        [orderId, it.product_id, it.qty, p.price]
+      );
+    }
+
+    // Atomic decrement stock per item
+    for (const it of normItems) {
+      const [upd] = await conn.query(
+        `UPDATE products
+         SET stock = stock - ?
+         WHERE id = ? AND stock >= ?`,
+        [it.qty, it.product_id, it.qty]
+      );
+
+      if (upd.affectedRows !== 1) {
+        // Someone else consumed stock hence rollback to prevent oversell
+        throw Object.assign(new Error("INSUFFICIENT_STOCK_DURING_UPDATE"), {
+          code: "INSUFFICIENT_STOCK_DURING_UPDATE"
+        });
+      }
+    }
+
+    await commitTx(conn);
+    return res.status(201).json({ order_id: orderId, status: "PLACED" });
+  } catch (e) {
+    if (conn) {
+      try { await rollbackTx(conn); } catch { /* ignore */ }
+    }
+
+    if (e && e.code === "INSUFFICIENT_STOCK_DURING_UPDATE") {
+      try {
+        const rejId = await createRejectedOrder(null, customer_email, normItems);
+        return res.status(409).json({
+          order_id: rejId,
+          status: "REJECTED",
+          reason: "Insufficient stock"
+        });
+      } catch (inner) {
+        return next(inner);
+      }
+    }
+
+    next(e);
+  } finally {
+    if (conn) conn.release();
+  }
+});
+
+  // GET /reports/orders?from=YYYY-MM-DD&to=YYYY-MM-DD
+  // Returns:
+  // - order_id, customer_email, status
+  // - total_amount = SUM(qty * unit_price)
+  // - item_count = SUM(qty)
+  // - created_at
+app.get("/reports/orders", async (req, res, next) => {
+  const { from, to } = req.query;
+
+  if (!isISODate(from) || !isISODate(to)) {
+    return res.status(400).json({ error: "from/to must be YYYY-MM-DD" });
+  }
+
+  try {
+    const [rows] = await pool.query(
+      `
+      SELECT
+        o.id AS order_id,
+        o.customer_email,
+        o.status,
+        COALESCE(SUM(oi.qty * oi.unit_price), 0) AS total_amount,
+        COALESCE(SUM(oi.qty), 0) AS item_count,
+        o.created_at
+      FROM orders o
+      LEFT JOIN order_items oi ON oi.order_id = o.id
+      WHERE o.created_at >= STR_TO_DATE(?, '%Y-%m-%d')
+        AND o.created_at <  DATE_ADD(STR_TO_DATE(?, '%Y-%m-%d'), INTERVAL 1 DAY)
+      GROUP BY o.id
+      ORDER BY o.created_at DESC
+      `,
+      [from, to]
+    );
+
+    res.json(rows);
+  } catch (e) {
+    next(e);
+  }
+});
+
+
+ // GET /reports/top-products
+ // Returns Top 3 products by sold quantity in last 7 days (PLACED only)
+ //- product_id, name, sold_qty
+app.get("/reports/top-products", async (_req, res, next) => {
+  try {
+    const [rows] = await pool.query(
+      `
+      SELECT
+        p.id AS product_id,
+        p.name,
+        SUM(oi.qty) AS sold_qty
+      FROM order_items oi
+      JOIN orders o   ON o.id = oi.order_id
+      JOIN products p ON p.id = oi.product_id
+      WHERE o.status = 'PLACED'
+        AND o.created_at >= NOW() - INTERVAL 7 DAY
+      GROUP BY p.id, p.name
+      ORDER BY sold_qty DESC
+      LIMIT 3
+      `
+    );
+    res.json(rows);
+  } catch (e) {
+    next(e);
+  }
+});
+
+// Error handler
+app.use((err, _req, res, _next) => {
+  console.error(err);
+  res.status(500).json({ error: "Internal Server Error" });
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on :${PORT}`);
+  console.log(`Tip: GET /schema to view schema SQL`);
 });
