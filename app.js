@@ -7,7 +7,7 @@ app.use(express.json());
 
 const PORT = Number(process.env.PORT || 3000);
 
-// ----- MySQL pool -----
+// MySQL pool
 const pool = mysql.createPool({
   host: process.env.DB_HOST,
   port: Number(process.env.DB_PORT || 3306),
@@ -19,7 +19,7 @@ const pool = mysql.createPool({
   queueLimit: 0
 });
 
-// ----- Schema SQL (run once in MySQL client) -----
+// Schema SQL (run once in MySQL client)
 const SCHEMA_SQL = `
 CREATE DATABASE IF NOT EXISTS tiny_orders;
 USE tiny_orders;
@@ -61,7 +61,7 @@ CREATE INDEX idx_order_items_order_id ON order_items(order_id);
 CREATE INDEX idx_order_items_product_id ON order_items(product_id);
 `;
 
-// ----- Helpers -----
+// Helpers
 function isISODate(s) {
   return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
 }
@@ -102,3 +102,114 @@ async function commitTx(conn) {
 async function rollbackTx(conn) {
   await conn.query("ROLLBACK");
 }
+
+// Create REJECTED order (no stock changes) Runs its own transaction
+async function createRejectedOrder(conn, customer_email, normItems) {
+  let localConn = conn;
+  let shouldRelease = false;
+
+  if (!localConn) {
+    localConn = await pool.getConnection();
+    shouldRelease = true;
+  }
+
+  await startTx(localConn);
+  try {
+    const [orderRes] = await localConn.query(
+      `INSERT INTO orders (customer_email, status) VALUES (?, 'REJECTED')`,
+      [customer_email]
+    );
+    const orderId = orderRes.insertId;
+
+    // Get current price for known products, else 0
+    const ids = normItems.map(x => x.product_id);
+    const placeholders = ids.map(() => "?").join(",");
+    const [products] = await localConn.query(
+      `SELECT id, price FROM products WHERE id IN (${placeholders})`,
+      ids
+    );
+    const pMap = new Map(products.map(p => [Number(p.id), p]));
+
+    for (const it of normItems) {
+      const unitPrice = pMap.get(it.product_id)?.price ?? 0;
+      await localConn.query(
+        `INSERT INTO order_items (order_id, product_id, qty, unit_price)
+         VALUES (?, ?, ?, ?)`,
+        [orderId, it.product_id, it.qty, unitPrice]
+      );
+    }
+
+    await commitTx(localConn);
+    return orderId;
+  } catch (e) {
+    await rollbackTx(localConn);
+    throw e;
+  } finally {
+    if (shouldRelease) localConn.release();
+  }
+}
+
+// Routes
+
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+// GET /schema
+app.get("/schema", (_req, res) => {
+  res.type("text/plain").send(SCHEMA_SQL);
+});
+
+// POST /seed
+// Creates 20 products (upsert by unique name)
+app.post("/seed", async (_req, res, next) => {
+  let conn;
+  try {
+    conn = await pool.getConnection();
+    await startTx(conn);
+
+    const base = [
+      { name: "Keyboard", stock: 5, price: 49.99 },
+      { name: "Mouse", stock: 10, price: 19.99 },
+      { name: "Monitor", stock: 2, price: 199.99 }
+    ];
+
+    for (let i = base.length; i < 20; i++) {
+      base.push({
+        name: `Product-${i + 1}`,
+        stock: 3 + (i % 8),
+        price: Number((10 + i * 2.15).toFixed(2))
+      });
+    }
+
+    for (const p of base) {
+      await conn.query(
+        `
+        INSERT INTO products (name, stock, price)
+        VALUES (?, ?, ?)
+        ON DUPLICATE KEY UPDATE stock = VALUES(stock), price = VALUES(price)
+        `,
+        [p.name, p.stock, p.price]
+      );
+    }
+
+    await commitTx(conn);
+    res.json({ ok: true, inserted_or_updated: base.length });
+  } catch (e) {
+    if (conn) await rollbackTx(conn);
+    next(e);
+  } finally {
+    if (conn) conn.release();
+  }
+});
+
+// GET /products
+// Returns id, name, stock, price
+app.get("/products", async (_req, res, next) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, name, stock, price FROM products ORDER BY id ASC`
+    );
+    res.json(rows);
+  } catch (e) {
+    next(e);
+  }
+});
