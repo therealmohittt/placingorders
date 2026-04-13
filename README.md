@@ -11,3 +11,44 @@ multi tier code using node.js, express.js and mySQL with the required schema, en
 // GET /schema
 // POST /seed // Creates 20 products (upsert by unique name)
 // GET /products // Returns id, name, stock, price
+
+How to setup:
+npm i express mysql2 dotenv
+we need to setup .env with MySQL credentials or we can setup it via GitHub Actions (preferred)
+we need to run the schema and the query which is written
+node app.js
+
+How i ensured atomicity:
+firstly atomicity and concurrency safety are guaranteed at the database level.
+single database transaction and if any step fails then the transaction is rolled back.
+before checking the stock the API locks all involved product rows:
+SELECT id, stock, price
+FROM products
+WHERE id ..
+FOR UPDATE;
+validates stocks while the rows are locked.
+atomic stock deduction using conditional update.
+
+Sample CURL Requests:
+curl -X POST http://localhost:3000/seed
+``
+this creates 20 products
+
+curl http://localhost:3000/products
+this will show you the products created with their respective headers
+
+curl -X POST http://localhost:3000/orders \
+-H "Content-Type: application/json" \
+-d '{
+"customer_email": xyz@gmail.com",
+"items": [
+{ "product_id": 1, "qty": 2 },
+{ "product_id": 2, "qty": 3 }
+]
+}'
+
+this will give response as:
+{
+"order_id": 1,
+"status": "PLACED"
+}
